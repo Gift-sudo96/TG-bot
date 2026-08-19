@@ -39,7 +39,10 @@ TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 ALLOWED = {int(x) for x in re.findall(r"-?\d+", os.environ.get("ALLOWED_IDS", ""))}
 NOTIFY_ALL = os.environ.get("NOTIFY_ALL", "true").lower() in ("1", "true", "yes")
 TZ = ZoneInfo(os.environ.get("TZ_NAME", "Europe/Kyiv"))
-DEFAULT_HOUR = int(os.environ.get("DEFAULT_HOUR", "10"))
+DEFAULT_HOUR = int(os.environ.get("DEFAULT_HOUR", "9"))
+DAY_START = int(os.environ.get("DAY_START", "9"))    # раніше не турбуємо
+DAY_END = int(os.environ.get("DAY_END", "21"))       # пізніше теж
+REPEAT_HOURS = int(os.environ.get("REPEAT_HOURS", "4"))
 CHECK_EVERY = 30  # секунд між перевірками бази
 
 # "547696309:Сергій,388521288:Аріна" -> {547696309: "Сергій", ...}
@@ -48,6 +51,8 @@ for _pair in os.environ.get("NAMES", "").split(","):
     _id, _, _name = _pair.partition(":")
     if _id.strip().isdigit() and _name.strip():
         NAMES[int(_id.strip())] = _name.strip()
+
+timeparse.DEFAULT_HOUR = DEFAULT_HOUR   # "завтра" без часу -> ця година
 
 
 def check_token(token):
@@ -134,15 +139,38 @@ def hhmm(iso_str):
     return datetime.fromisoformat(iso_str).astimezone(TZ).strftime("%H:%M")
 
 
-def next_occurrence(iso_str, now):
-    """Наступний показ нагадування — той самий час наступної доби.
+def next_nine():
+    """Найближча 9:00 ранку — коли час нагадування не вказали взагалі."""
+    now = datetime.now(TZ)
+    dt = now.replace(hour=DAY_START, minute=0, second=0, microsecond=0)
+    return dt if dt > now else dt + timedelta(days=1)
 
+
+def _step(dt):
+    """Один крок повтору: +4 години, але не поза межами 9:00-21:00."""
+    local = (dt + timedelta(hours=REPEAT_HOURS)).astimezone(TZ)
+    late = local.hour > DAY_END or (local.hour == DAY_END and
+                                    (local.minute or local.second))
+    if late:                                     # після 21:00 -> завтра зранку
+        local += timedelta(days=1)
+    if late or local.hour < DAY_START:           # до 9:00 -> сьогодні о 9:00
+        local = local.replace(hour=DAY_START, minute=0, second=0, microsecond=0)
+    return local.astimezone(timezone.utc)
+
+
+def next_occurrence(iso_str, now):
+    """Коли показати нагадування наступного разу.
+
+    Поки не натиснули «Готово», нагадування повертається кожні
+    REPEAT_HOURS годин у межах дня, а після DAY_END — наступного ранку.
     Якщо бот лежав кілька діб, перескакуємо одразу в майбутнє, щоб не
     сипати пропущеними нагадуваннями поспіль.
     """
     nxt = datetime.fromisoformat(iso_str)
-    while nxt <= now:
-        nxt += timedelta(days=1)
+    for _ in range(10000):                       # запобіжник від зациклення
+        if nxt > now:
+            break
+        nxt = _step(nxt)
     return nxt
 
 
@@ -183,16 +211,6 @@ def parse_when(text):
 
 
 # --------------------------------------------------------------- клавіатури
-
-def kb_choose(rid):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="1 день", callback_data=f"set:{rid}:1"),
-         InlineKeyboardButton(text="3 дні", callback_data=f"set:{rid}:3")],
-        [InlineKeyboardButton(text="7 днів", callback_data=f"set:{rid}:7"),
-         InlineKeyboardButton(text="30 днів", callback_data=f"set:{rid}:30")],
-        [InlineKeyboardButton(text="✖ Не треба", callback_data=f"drop:{rid}")],
-    ])
-
 
 def kb_remind(rid):
     """Відкладати вручну не треба — нагадування саме повертається щодня."""
@@ -241,8 +259,12 @@ HELP = (
     "<code>о 7 вечора</code> <code>вранці</code>\n"
     "• <code>через 2 години</code> <code>через тиждень</code> "
     "<code>+3д</code> <code>30хв</code>\n\n"
-    "Великі чи малі букви — байдуже. Якщо часу в тексті немає, "
-    "бот сам запитає кнопками.\n\n"
+    "Великі чи малі букви — байдуже.\n\n"
+    "<b>Якщо часу не вказати</b> — нагадаю <b>завтра о 9:00</b>. "
+    "Щоб перенести, просто напиши те саме ще раз із часом.\n\n"
+    "<b>Поки не натиснули «Готово»</b> нагадування повертається кожні "
+    "4 години, але тільки з 9:00 до 21:00. Пізно ввечері не турбує — "
+    "переносить на наступний ранок.\n\n"
     "<b>Команди</b>\n"
     "/list — активні нагадування\n"
     "/cancel 12 — скасувати нагадування №12\n"
@@ -273,7 +295,7 @@ async def cmd_list(m: Message):
         return await m.answer("Активних нагадувань немає.")
     lines = ["<b>Активні нагадування</b>"]
     for r in rows:
-        again = f"  ({r['times_sent']}-й день)" if (r["times_sent"] or 0) > 1 else ""
+        again = f"  ({r['times_sent']}-й раз)" if (r["times_sent"] or 0) > 1 else ""
         lines.append(f"<code>#{r['id']}</code>  {human(r['remind_at'])}  "
                      f"{(r['note'] or '—')[:60]}{again}")
     lines.append("\nСкасувати: <code>/cancel НОМЕР</code>")
@@ -295,69 +317,28 @@ async def cmd_cancel(m: Message):
                    else f"Нагадування #{rid} не знайдено серед активних.")
 
 
-@dp.message(F.reply_to_message, F.text)
-async def reply_with_time(m: Message):
-    """Відповідь на питання «коли нагадати?» задає строк для чернетки."""
-    if not allowed(m.from_user.id):
-        return
-    row = db.execute(
-        "SELECT * FROM reminders WHERE prompt_msg_id=? AND status='draft'",
-        (m.reply_to_message.message_id,)).fetchone()
-    if row is None:
-        return await catch_all(m)
-    when, note = parse_when(m.text)
-    if when is None:
-        return await m.answer("Не зрозумів строк. Напр.: <code>3д</code>, "
-                              "<code>15.09 14:30</code>, <code>завтра 10:00</code>")
-    db.execute("UPDATE reminders SET remind_at=?, status='pending', note=? WHERE id=?",
-               (when, note or row["note"], row["id"]))
-    db.commit()
-    await m.answer(confirm(when, row["id"]))
-
-
 @dp.message(F.photo | F.document | F.video | F.text)
 async def catch_all(m: Message):
     if not allowed(m.from_user.id):
         return await m.answer(f"Немає доступу. Твій ID: <code>{m.from_user.id}</code>")
 
     when, note = parse_when(m.caption or m.text or "")
+    guessed = when is None
+    if guessed:                      # часу в тексті немає -> завтра о 9:00
+        when = iso(next_nine())
 
     cur = db.execute(
         "INSERT INTO reminders (creator_id, creator_name, src_chat_id, src_msg_id,"
-        " note, created_at, remind_at, status) VALUES (?,?,?,?,?,?,?,?)",
+        " note, created_at, remind_at, status) VALUES (?,?,?,?,?,?,?,'pending')",
         (m.from_user.id, uname(m), m.chat.id, m.message_id, note,
-         iso(now_utc()), when, "pending" if when else "draft"))
+         iso(now_utc()), when))
     db.commit()
     rid = cur.lastrowid
 
-    if when:
-        return await m.reply(confirm(when, rid))
-
-    prompt = await m.reply(
-        "Коли нагадати? Обери кнопку або <b>відповідай на це повідомлення</b> "
-        "часом — напр. <code>15.09 14:30</code>",
-        reply_markup=kb_choose(rid))
-    db.execute("UPDATE reminders SET prompt_msg_id=? WHERE id=?", (prompt.message_id, rid))
-    db.commit()
-
-
-@dp.callback_query(F.data.startswith("set:"))
-async def cb_set(c: CallbackQuery):
-    _, rid, days = c.data.split(":")
-    when = iso(now_utc() + timedelta(days=int(days)))
-    db.execute("UPDATE reminders SET remind_at=?, status='pending' WHERE id=?", (when, rid))
-    db.commit()
-    await c.message.edit_text(confirm(when, rid))
-    await c.answer()
-
-
-@dp.callback_query(F.data.startswith("drop:"))
-async def cb_drop(c: CallbackQuery):
-    rid = c.data.split(":")[1]
-    db.execute("UPDATE reminders SET status='cancelled' WHERE id=?", (rid,))
-    db.commit()
-    await c.message.edit_text("Скасовано.")
-    await c.answer()
+    text = confirm(when, rid)
+    if guessed:
+        text += "\nЧасу не було вказано. Інший — просто напиши ще раз із ним."
+    await m.reply(text)
 
 
 @dp.callback_query(F.data.startswith("done:"))
@@ -401,8 +382,9 @@ def reminder_text(r):
     at = hhmm(r["remind_at"])
     head = f"⏰ <b>{note}</b> в {at}" if note else f"⏰ <b>Нагадування</b> на {at}"
     who = person(r["creator_id"], r["creator_name"])
-    day = (r["times_sent"] or 0) + 1
-    return head + "\n" + (who if day == 1 else f"{who} · {day}-й день")
+    # повтори тепер частіші за добу, тому рахуємо рази, а не дні
+    n = (r["times_sent"] or 0) + 1
+    return head + "\n" + (who if n == 1 else f"{who} · нагадую {n}-й раз")
 
 
 async def send_reminder(r):
@@ -434,10 +416,6 @@ async def reminder_loop():
                 db.commit()
                 await send_reminder(r)
 
-            # прибираємо чернетки, для яких строк так і не вказали
-            db.execute("DELETE FROM reminders WHERE status='draft' AND created_at < ?",
-                       (iso(now_utc() - timedelta(days=2)),))
-            db.commit()
         except Exception:
             log.exception("помилка в циклі нагадувань")
         await asyncio.sleep(CHECK_EVERY)
