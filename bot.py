@@ -3,6 +3,7 @@
 Кидаєш боту скрін або текст, вказуєш коли нагадати — бот нагадає.
 """
 import asyncio
+import html
 import logging
 import os
 import re
@@ -327,10 +328,15 @@ async def catch_all(m: Message):
     if guessed:                      # часу в тексті немає -> завтра о 9:00
         when = iso(next_nine())
 
+    # копіюємо оригінал лише коли там є що показувати. Для звичайного
+    # тексту опис уже все несе, і друге повідомлення було б дублем.
+    media = bool(m.photo or m.document or m.video or m.animation
+                 or m.audio or m.voice or m.video_note)
+
     cur = db.execute(
         "INSERT INTO reminders (creator_id, creator_name, src_chat_id, src_msg_id,"
         " note, created_at, remind_at, status) VALUES (?,?,?,?,?,?,?,'pending')",
-        (m.from_user.id, uname(m), m.chat.id, m.message_id, note,
+        (m.from_user.id, uname(m), m.chat.id, m.message_id if media else None, note,
          iso(now_utc()), when))
     db.commit()
     rid = cur.lastrowid
@@ -348,15 +354,23 @@ async def cb_done(c: CallbackQuery):
     db.execute("UPDATE reminders SET status='done' WHERE id=?", (rid,))
     db.commit()
 
-    note = (row["note"] or "").strip() if row else ""
-    closer = person(c.from_user.id, c.from_user.first_name)
-    text = f"✅ {note or 'Нагадування'} — закрито ({closer})"
+    note = note_of(row) if row else ""
+    closer = html.escape(person(c.from_user.id, c.from_user.first_name))
+    text = (f"✅ <s>{note}</s>" if note else "✅ <s>Нагадування</s>")
+    text += f"\nзакрито · {closer} · {datetime.now(TZ):%H:%M}"
 
     # оновлюємо всі копії, щоб і друга людина побачила, що справу закрито
+    was_photo = bool(row and row["src_msg_id"])
     for s in db.execute("SELECT * FROM sent WHERE reminder_id=?", (rid,)).fetchall():
         try:
-            await bot.edit_message_text(text, chat_id=s["chat_id"],
-                                        message_id=s["message_id"])
+            if was_photo:     # у фото редагується підпис, а не текст
+                await bot.edit_message_caption(chat_id=s["chat_id"],
+                                               message_id=s["message_id"],
+                                               caption=text,
+                                               parse_mode=ParseMode.HTML)
+            else:
+                await bot.edit_message_text(text, chat_id=s["chat_id"],
+                                            message_id=s["message_id"])
         except Exception:
             pass          # повідомлення могли видалити або воно вже таке саме
     db.execute("DELETE FROM sent WHERE reminder_id=?", (rid,))
@@ -376,29 +390,47 @@ async def cb_snooze(c: CallbackQuery):
 
 # ------------------------------------------------------- цикл нагадувань
 
+def note_of(r):
+    """Опис нагадування, безпечний для HTML і обрізаний під ліміт підпису."""
+    return html.escape((r["note"] or "").strip())[:700]
+
+
 def reminder_text(r):
-    """Суть + час, другим рядком автор і котрий це день поспіль."""
-    note = (r["note"] or "").strip()
-    at = hhmm(r["remind_at"])
-    head = f"⏰ <b>{note}</b> в {at}" if note else f"⏰ <b>Нагадування</b> на {at}"
-    who = person(r["creator_id"], r["creator_name"])
-    # повтори тепер частіші за добу, тому рахуємо рази, а не дні
+    """Суть окремим рядком, під нею сірим час, автор і лічильник повторів."""
+    note = note_of(r)
+    who = html.escape(person(r["creator_id"], r["creator_name"]))
+    meta = f"на {hhmm(r['remind_at'])} · {who}"
     n = (r["times_sent"] or 0) + 1
-    return head + "\n" + (who if n == 1 else f"{who} · нагадую {n}-й раз")
+    if n > 1:                       # повтори частіші за добу, тому рахуємо рази
+        meta += f" · 🔁 {n}-й раз"
+    return (f"⏰ <b>{note}</b>" if note else "⏰ <b>Нагадування</b>") + "\n" + meta
 
 
 async def send_reminder(r):
     text = reminder_text(r)
+    kb = kb_remind(r["id"])
     for chat_id in targets(r["creator_id"]):
+        mid = None
         try:
-            msg = await bot.send_message(chat_id, text, reply_markup=kb_remind(r["id"]))
-            db.execute("INSERT INTO sent (reminder_id, chat_id, message_id) VALUES (?,?,?)",
-                       (r["id"], chat_id, msg.message_id))
-            db.commit()
             if r["src_msg_id"]:
-                await bot.copy_message(chat_id, r["src_chat_id"], r["src_msg_id"])
+                # скрін і підпис одним повідомленням, щоб кнопка явно
+                # належала саме цьому скріну, а не висіла окремо над ним
+                res = await bot.copy_message(chat_id, r["src_chat_id"], r["src_msg_id"],
+                                             caption=text, parse_mode=ParseMode.HTML,
+                                             reply_markup=kb)
+                mid = res.message_id
+            else:
+                mid = (await bot.send_message(chat_id, text, reply_markup=kb)).message_id
         except Exception:
-            log.exception("не вдалось надіслати нагадування #%s у чат %s", r["id"], chat_id)
+            log.exception("не вдалось надіслати #%s у чат %s", r["id"], chat_id)
+            try:            # оригінал могли видалити — доставимо хоча б текст
+                mid = (await bot.send_message(chat_id, text, reply_markup=kb)).message_id
+            except Exception:
+                log.exception("і текстом теж не вийшло: #%s -> %s", r["id"], chat_id)
+        if mid:
+            db.execute("INSERT INTO sent (reminder_id, chat_id, message_id) VALUES (?,?,?)",
+                       (r["id"], chat_id, mid))
+            db.commit()
 
 
 async def reminder_loop():
