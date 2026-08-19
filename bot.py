@@ -17,6 +17,8 @@ from aiogram.filters import Command
 from aiogram.types import (CallbackQuery, InlineKeyboardButton,
                            InlineKeyboardMarkup, Message)
 
+import timeparse
+
 # ---------------------------------------------------------------- налаштування
 
 def _load_env(path=".env"):
@@ -100,88 +102,44 @@ def iso(dt):
 
 
 def human(iso_str):
-    """ISO-рядок з бази (UTC) -> '19.08 14:30' у місцевому часі."""
-    return datetime.fromisoformat(iso_str).astimezone(TZ).strftime("%d.%m %H:%M")
+    """ISO-рядок з бази (UTC) -> '19.08 14:30' у місцевому часі.
+
+    Рік дописується, лише якщо він не поточний — щоб не засмічувати.
+    """
+    dt = datetime.fromisoformat(iso_str).astimezone(TZ)
+    fmt = "%d.%m %H:%M" if dt.year == datetime.now(TZ).year else "%d.%m.%Y %H:%M"
+    return dt.strftime(fmt)
+
+
+def in_words(delta):
+    """timedelta -> 'через 25 хв' / 'через 3 год' / 'через 12 дн.'"""
+    mins = int(delta.total_seconds() // 60)
+    if mins < 60:
+        return f"через {max(mins, 1)} хв"
+    if mins < 60 * 24:
+        return f"через {mins // 60} год"
+    return f"через {mins // (60 * 24)} дн."
+
+
+def confirm(when, rid):
+    """Текст підтвердження після створення нагадування."""
+    dt = datetime.fromisoformat(when).astimezone(TZ)
+    now = datetime.now(TZ)
+    if dt <= now:
+        return (f"⚠️ <b>{human(when)}</b> — цей час уже минув, нагадаю одразу. "
+                f"Якщо помилка, зроби <code>/cancel {rid}</code>")
+    return f"✅ Нагадаю <b>{human(when)}</b> ({in_words(dt - now)})  <code>#{rid}</code>"
 
 
 # --------------------------------------------------------------- розбір часу
-
-UNITS = {
-    "хв": timedelta(minutes=1), "х": timedelta(minutes=1),
-    "г": timedelta(hours=1), "год": timedelta(hours=1),
-    "д": timedelta(days=1), "дн": timedelta(days=1),
-    "т": timedelta(weeks=1), "тиж": timedelta(weeks=1),
-    "міс": timedelta(days=30),
-}
-WEEKDAYS = {
-    "пн": 0, "понеділок": 0, "вт": 1, "вівторок": 1, "ср": 2, "середа": 2,
-    "чт": 3, "четвер": 3, "пт": 4, "пятниця": 4, "п'ятниця": 4,
-    "сб": 5, "субота": 5, "нд": 6, "неділя": 6,
-}
-
+# Уся логіка розпізнавання часу живе в timeparse.py, там же її тести
+# (test_parse.py). Тут лише перевід у UTC для бази.
 
 def parse_when(text):
-    """Шукає строк на ПОЧАТКУ тексту.
+    """Текст -> (ISO-рядок у UTC | None, опис без згадки часу)."""
+    dt, note = timeparse.parse(text, datetime.now(TZ))
+    return (iso(dt) if dt else None), note
 
-    Повертає (ISO-рядок у UTC | None, залишок тексту як нотатка).
-    """
-    t = (text or "").strip()
-    if not t:
-        return None, ""
-    now = datetime.now(TZ)
-
-    def at(dt, h, m):
-        return dt.replace(hour=h, minute=m, second=0, microsecond=0)
-
-    # +3д / 2г / 30хв / 1міс
-    m = re.match(r"^\+?(\d+)\s*(міс|тиж|хв|год|дн|д|г|т|х)\.?", t, re.I)
-    if m:
-        return iso(now + int(m.group(1)) * UNITS[m.group(2).lower()]), t[m.end():].strip()
-
-    # завтра / післязавтра [10:00]
-    m = re.match(r"^(післязавтра|завтра)(?:\s+(\d{1,2}):(\d{2}))?", t, re.I)
-    if m:
-        days = 2 if m.group(1).lower() == "післязавтра" else 1
-        h, mi = (int(m.group(2)), int(m.group(3))) if m.group(2) else (DEFAULT_HOUR, 0)
-        return iso(at(now + timedelta(days=days), h, mi)), t[m.end():].strip()
-
-    # 15.09 / 15.09.2026 / 15.09 14:30  (точка = дата, двокрапка = час)
-    m = re.match(r"^(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?(?:\s+(\d{1,2}):(\d{2}))?", t)
-    if m:
-        d, mo, yr = int(m.group(1)), int(m.group(2)), m.group(3)
-        h, mi = (int(m.group(4)), int(m.group(5))) if m.group(4) else (DEFAULT_HOUR, 0)
-        if 1 <= d <= 31 and 1 <= mo <= 12 and 0 <= h <= 23 and 0 <= mi <= 59:
-            year = now.year
-            if yr:
-                year = int(yr) + 2000 if len(yr) == 2 else int(yr)
-            try:
-                dt = now.replace(year=year, month=mo, day=d, hour=h, minute=mi,
-                                 second=0, microsecond=0)
-            except ValueError:
-                return None, t
-            if dt <= now and not yr:      # дата вже минула -> наступний рік
-                dt = dt.replace(year=year + 1)
-            return iso(dt), t[m.end():].strip()
-
-    # пн / пт 9:00
-    m = re.match(r"^([а-яіїєґ']{2,10})(?:\s+(\d{1,2}):(\d{2}))?", t, re.I)
-    if m and m.group(1).lower() in WEEKDAYS:
-        target = WEEKDAYS[m.group(1).lower()]
-        h, mi = (int(m.group(2)), int(m.group(3))) if m.group(2) else (DEFAULT_HOUR, 0)
-        ahead = (target - now.weekday()) % 7 or 7
-        return iso(at(now + timedelta(days=ahead), h, mi)), t[m.end():].strip()
-
-    # 14:30 -> сьогодні, або завтра якщо вже минуло
-    m = re.match(r"^(\d{1,2}):(\d{2})", t)
-    if m:
-        h, mi = int(m.group(1)), int(m.group(2))
-        if 0 <= h <= 23 and 0 <= mi <= 59:
-            dt = at(now, h, mi)
-            if dt <= now:
-                dt += timedelta(days=1)
-            return iso(dt), t[m.end():].strip()
-
-    return None, t
 
 
 # --------------------------------------------------------------- клавіатури
@@ -228,16 +186,24 @@ def uname(m):
 
 HELP = (
     "<b>Як користуватись</b>\n\n"
-    "Кинь скрін або текст і на <b>початку підпису</b> вкажи, коли нагадати:\n"
-    "<code>+3д Іван, 1500 грн, передзвонити</code>\n"
-    "<code>15.09 14:30 продовжити підписку</code>\n"
-    "<code>завтра 10:00 надіслати рахунок</code>\n"
-    "<code>пт передзвонити Олені</code>\n\n"
-    "Формати строку: <code>30хв</code> <code>2г</code> <code>3д</code> "
-    "<code>2тиж</code> <code>1міс</code> <code>15.09</code> "
-    "<code>15.09 14:30</code> <code>завтра</code> <code>пн 9:00</code> "
-    "<code>14:30</code>\n\n"
-    "Якщо строк не вказати — бот сам запитає кнопками.\n\n"
+    "Кинь скрін або просто напиши текст — і десь у ньому згадай, коли нагадати. "
+    "Де саме згадаєш, не має значення:\n\n"
+    "<code>завтра</code>\n"
+    "<code>фіскалізувати оплату в 5к. завтра в 10.00</code>\n"
+    "<code>передзвонити Олені через 2 години</code>\n"
+    "<code>15 вересня продовжити підписку</code>\n"
+    "<code>в понеділок о 9 планерка</code>\n\n"
+    "Решта тексту стане описом нагадування.\n\n"
+    "<b>Що розуміє</b>\n"
+    "• <code>завтра</code> <code>післязавтра</code> <code>сьогодні</code>\n"
+    "• <code>в пн</code> <code>у п'ятницю</code> <code>наступного вівторка</code>\n"
+    "• <code>15.09</code> <code>15.09.2027</code> <code>15 вересня</code>\n"
+    "• <code>о 14:30</code> <code>в 10.00</code> <code>о 12 годині</code> "
+    "<code>о 7 вечора</code> <code>вранці</code>\n"
+    "• <code>через 2 години</code> <code>через тиждень</code> "
+    "<code>+3д</code> <code>30хв</code>\n\n"
+    "Великі чи малі букви — байдуже. Якщо часу в тексті немає, "
+    "бот сам запитає кнопками.\n\n"
     "<b>Команди</b>\n"
     "/list — активні нагадування\n"
     "/cancel 12 — скасувати нагадування №12\n"
@@ -306,7 +272,7 @@ async def reply_with_time(m: Message):
     db.execute("UPDATE reminders SET remind_at=?, status='pending', note=? WHERE id=?",
                (when, note or row["note"], row["id"]))
     db.commit()
-    await m.answer(f"✅ Нагадаю <b>{human(when)}</b>  <code>#{row['id']}</code>")
+    await m.answer(confirm(when, row["id"]))
 
 
 @dp.message(F.photo | F.document | F.video | F.text)
@@ -325,7 +291,7 @@ async def catch_all(m: Message):
     rid = cur.lastrowid
 
     if when:
-        return await m.reply(f"✅ Нагадаю <b>{human(when)}</b>  <code>#{rid}</code>")
+        return await m.reply(confirm(when, rid))
 
     prompt = await m.reply(
         "Коли нагадати? Обери кнопку або <b>відповідай на це повідомлення</b> "
@@ -341,7 +307,7 @@ async def cb_set(c: CallbackQuery):
     when = iso(now_utc() + timedelta(days=int(days)))
     db.execute("UPDATE reminders SET remind_at=?, status='pending' WHERE id=?", (when, rid))
     db.commit()
-    await c.message.edit_text(f"✅ Нагадаю <b>{human(when)}</b>  <code>#{rid}</code>")
+    await c.message.edit_text(confirm(when, rid))
     await c.answer()
 
 
