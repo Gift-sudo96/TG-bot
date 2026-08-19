@@ -13,8 +13,9 @@ import bot as b
 
 async def main():
     tg = Bot(b.TOKEN)
-    print(f"NOTIFY_ALL={b.NOTIFY_ALL} -> нагадування йдуть "
-          f"{'усім зі списку' if b.NOTIFY_ALL else 'лише автору'}\n")
+    kind = {"others": "усім, крім автора", "all": "усім зі списку",
+            "author": "лише автору"}.get(b.REMIND_TO, b.REMIND_TO)
+    print(f"REMIND_TO={b.REMIND_TO} -> нагадування йдуть {kind}\n")
     for uid in sorted(b.ALLOWED):
         try:
             chat = await tg.get_chat(uid)

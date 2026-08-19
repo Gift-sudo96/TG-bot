@@ -38,7 +38,9 @@ _load_env()
 
 TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 ALLOWED = {int(x) for x in re.findall(r"-?\d+", os.environ.get("ALLOWED_IDS", ""))}
-NOTIFY_ALL = os.environ.get("NOTIFY_ALL", "true").lower() in ("1", "true", "yes")
+# кому показувати нагадування: others — усім, крім автора (за замовчуванням),
+# all — усім разом з автором, author — лише автору
+REMIND_TO = os.environ.get("REMIND_TO", "others").strip().lower()
 TZ = ZoneInfo(os.environ.get("TZ_NAME", "Europe/Kyiv"))
 DEFAULT_HOUR = int(os.environ.get("DEFAULT_HOUR", "9"))
 DAY_START = int(os.environ.get("DAY_START", "9"))    # раніше не турбуємо
@@ -190,14 +192,15 @@ def in_words(delta):
     return f"через {mins // (60 * 24)} дн."
 
 
-def confirm(when, rid):
+def confirm(when, rid, who_ids=()):
     """Текст підтвердження після створення нагадування."""
     dt = datetime.fromisoformat(when).astimezone(TZ)
     now = datetime.now(TZ)
+    who = ", ".join(html.escape(person(i)) for i in who_ids)
+    tail = f"\nотримає {who}  ·  <code>#{rid}</code>" if who else f"  <code>#{rid}</code>"
     if dt <= now:
-        return (f"⚠️ <b>{human(when)}</b> — цей час уже минув, нагадаю одразу. "
-                f"Якщо помилка, зроби <code>/cancel {rid}</code>")
-    return f"✅ Нагадаю <b>{human(when)}</b> ({in_words(dt - now)})  <code>#{rid}</code>"
+        return f"⚠️ <b>{human(when)}</b> — цей час уже минув, нагадаю одразу.{tail}"
+    return f"✅ Нагадаю <b>{human(when)}</b> ({in_words(dt - now)}){tail}"
 
 
 # --------------------------------------------------------------- розбір часу
@@ -231,10 +234,17 @@ def allowed(uid):
 
 
 def targets(creator_id):
-    """Кому надсилати нагадування."""
-    if NOTIFY_ALL and ALLOWED:
+    """Кому надсилати нагадування.
+
+    За замовчуванням нагадування бачить не автор, а друга людина: хто
+    записав — той пам'ятає, а зробити має інший. Автору натомість
+    прилітає повідомлення, коли справу закрили.
+    """
+    if not ALLOWED or REMIND_TO == "author":
+        return [creator_id]
+    if REMIND_TO == "all":
         return sorted(ALLOWED)
-    return [creator_id]
+    return sorted(ALLOWED - {creator_id}) or [creator_id]
 
 
 def uname(m):
@@ -266,6 +276,9 @@ HELP = (
     "<b>Поки не натиснули «Готово»</b> нагадування повертається кожні "
     "4 години, але тільки з 9:00 до 21:00. Пізно ввечері не турбує — "
     "переносить на наступний ранок.\n\n"
+    "<b>Кому приходить.</b> Нагадування бачить не той, хто його записав, "
+    "а друга людина. Автору натомість прилітає звістка, коли справу "
+    "закрили.\n\n"
     "<b>Команди</b>\n"
     "/list — активні нагадування\n"
     "/cancel 12 — скасувати нагадування №12\n"
@@ -341,7 +354,7 @@ async def catch_all(m: Message):
     db.commit()
     rid = cur.lastrowid
 
-    text = confirm(when, rid)
+    text = confirm(when, rid, targets(m.from_user.id))
     if guessed:
         text += "\nЧасу не було вказано. Інший — просто напиши ще раз із ним."
     await m.reply(text)
@@ -361,7 +374,9 @@ async def cb_done(c: CallbackQuery):
 
     # оновлюємо всі копії, щоб і друга людина побачила, що справу закрито
     was_photo = bool(row and row["src_msg_id"])
-    for s in db.execute("SELECT * FROM sent WHERE reminder_id=?", (rid,)).fetchall():
+    rows = db.execute("SELECT * FROM sent WHERE reminder_id=?", (rid,)).fetchall()
+    got_it = {s["chat_id"] for s in rows}
+    for s in rows:
         try:
             if was_photo:     # у фото редагується підпис, а не текст
                 await bot.edit_message_caption(chat_id=s["chat_id"],
@@ -373,6 +388,15 @@ async def cb_done(c: CallbackQuery):
                                             message_id=s["message_id"])
         except Exception:
             pass          # повідомлення могли видалити або воно вже таке саме
+
+    # автор нагадування його не бачив, тож повідомляємо окремо, що закрито
+    author = row["creator_id"] if row else None
+    if author and author not in got_it and author != c.from_user.id:
+        try:
+            await bot.send_message(author, text)
+        except Exception:
+            log.exception("не вдалось сповістити автора #%s", rid)
+
     db.execute("DELETE FROM sent WHERE reminder_id=?", (rid,))
     db.commit()
     await c.answer("Готово")
@@ -459,7 +483,7 @@ async def main():
     if not ALLOWED:
         log.warning("ALLOWED_IDS порожній — боту може писати будь-хто! "
                     "Напиши боту /id і додай свій ID у .env")
-    log.info("старт; дозволені ID: %s; NOTIFY_ALL=%s", ALLOWED or "всі", NOTIFY_ALL)
+    log.info("старт; дозволені ID: %s; нагадування -> %s", ALLOWED or "всі", REMIND_TO)
     asyncio.create_task(reminder_loop())
     await dp.start_polling(bot)
 
