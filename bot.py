@@ -42,6 +42,13 @@ TZ = ZoneInfo(os.environ.get("TZ_NAME", "Europe/Kyiv"))
 DEFAULT_HOUR = int(os.environ.get("DEFAULT_HOUR", "10"))
 CHECK_EVERY = 30  # секунд між перевірками бази
 
+# "547696309:Сергій,388521288:Аріна" -> {547696309: "Сергій", ...}
+NAMES = {}
+for _pair in os.environ.get("NAMES", "").split(","):
+    _id, _, _name = _pair.partition(":")
+    if _id.strip().isdigit() and _name.strip():
+        NAMES[int(_id.strip())] = _name.strip()
+
 
 def check_token(token):
     """Зрозуміла помилка замість стектрейсу, якщо токен зіпсований."""
@@ -89,7 +96,18 @@ CREATE TABLE IF NOT EXISTS reminders (
   prompt_msg_id  INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_due ON reminders(status, remind_at);
+
+-- які повідомлення бот надіслав по кожному нагадуванню, щоб при
+-- натисканні "Готово" оновити їх усі, а не лише те, де натиснули
+CREATE TABLE IF NOT EXISTS sent (
+  reminder_id INTEGER NOT NULL,
+  chat_id     INTEGER NOT NULL,
+  message_id  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sent ON sent(reminder_id);
 """)
+if "times_sent" not in {c[1] for c in db.execute("PRAGMA table_info(reminders)")}:
+    db.execute("ALTER TABLE reminders ADD COLUMN times_sent INTEGER DEFAULT 0")
 db.commit()
 
 
@@ -109,6 +127,28 @@ def human(iso_str):
     dt = datetime.fromisoformat(iso_str).astimezone(TZ)
     fmt = "%d.%m %H:%M" if dt.year == datetime.now(TZ).year else "%d.%m.%Y %H:%M"
     return dt.strftime(fmt)
+
+
+def hhmm(iso_str):
+    """ISO-рядок з бази (UTC) -> '11:00' у місцевому часі."""
+    return datetime.fromisoformat(iso_str).astimezone(TZ).strftime("%H:%M")
+
+
+def next_occurrence(iso_str, now):
+    """Наступний показ нагадування — той самий час наступної доби.
+
+    Якщо бот лежав кілька діб, перескакуємо одразу в майбутнє, щоб не
+    сипати пропущеними нагадуваннями поспіль.
+    """
+    nxt = datetime.fromisoformat(iso_str)
+    while nxt <= now:
+        nxt += timedelta(days=1)
+    return nxt
+
+
+def person(uid, fallback=""):
+    """Імʼя для підпису: спершу з NAMES, інакше з профілю Telegram."""
+    return NAMES.get(uid) or fallback or str(uid)
 
 
 def in_words(delta):
@@ -155,10 +195,9 @@ def kb_choose(rid):
 
 
 def kb_remind(rid):
+    """Відкладати вручну не треба — нагадування саме повертається щодня."""
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Готово", callback_data=f"done:{rid}"),
-        InlineKeyboardButton(text="⏰ +1 день", callback_data=f"snz:{rid}:1"),
-        InlineKeyboardButton(text="⏰ +7 днів", callback_data=f"snz:{rid}:7"),
     ]])
 
 
@@ -234,8 +273,9 @@ async def cmd_list(m: Message):
         return await m.answer("Активних нагадувань немає.")
     lines = ["<b>Активні нагадування</b>"]
     for r in rows:
+        again = f"  ({r['times_sent']}-й день)" if (r["times_sent"] or 0) > 1 else ""
         lines.append(f"<code>#{r['id']}</code>  {human(r['remind_at'])}  "
-                     f"{(r['note'] or '—')[:60]}")
+                     f"{(r['note'] or '—')[:60]}{again}")
     lines.append("\nСкасувати: <code>/cancel НОМЕР</code>")
     await m.answer("\n".join(lines))
 
@@ -322,10 +362,24 @@ async def cb_drop(c: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("done:"))
 async def cb_done(c: CallbackQuery):
-    rid = c.data.split(":")[1]
+    rid = int(c.data.split(":")[1])
+    row = db.execute("SELECT * FROM reminders WHERE id=?", (rid,)).fetchone()
     db.execute("UPDATE reminders SET status='done' WHERE id=?", (rid,))
     db.commit()
-    await c.message.edit_text(f"✅ Закрито  <code>#{rid}</code>")
+
+    note = (row["note"] or "").strip() if row else ""
+    closer = person(c.from_user.id, c.from_user.first_name)
+    text = f"✅ {note or 'Нагадування'} — закрито ({closer})"
+
+    # оновлюємо всі копії, щоб і друга людина побачила, що справу закрито
+    for s in db.execute("SELECT * FROM sent WHERE reminder_id=?", (rid,)).fetchall():
+        try:
+            await bot.edit_message_text(text, chat_id=s["chat_id"],
+                                        message_id=s["message_id"])
+        except Exception:
+            pass          # повідомлення могли видалити або воно вже таке саме
+    db.execute("DELETE FROM sent WHERE reminder_id=?", (rid,))
+    db.commit()
     await c.answer("Готово")
 
 
@@ -341,13 +395,24 @@ async def cb_snooze(c: CallbackQuery):
 
 # ------------------------------------------------------- цикл нагадувань
 
+def reminder_text(r):
+    """Суть + час, другим рядком автор і котрий це день поспіль."""
+    note = (r["note"] or "").strip()
+    at = hhmm(r["remind_at"])
+    head = f"⏰ <b>{note}</b> в {at}" if note else f"⏰ <b>Нагадування</b> на {at}"
+    who = person(r["creator_id"], r["creator_name"])
+    day = (r["times_sent"] or 0) + 1
+    return head + "\n" + (who if day == 1 else f"{who} · {day}-й день")
+
+
 async def send_reminder(r):
-    head = (f"⏰ <b>Нагадування</b>  <code>#{r['id']}</code>\n"
-            f"{r['note'] or '(без опису)'}\n"
-            f"<i>створено {human(r['created_at'])} · {r['creator_name']}</i>")
+    text = reminder_text(r)
     for chat_id in targets(r["creator_id"]):
         try:
-            await bot.send_message(chat_id, head, reply_markup=kb_remind(r["id"]))
+            msg = await bot.send_message(chat_id, text, reply_markup=kb_remind(r["id"]))
+            db.execute("INSERT INTO sent (reminder_id, chat_id, message_id) VALUES (?,?,?)",
+                       (r["id"], chat_id, msg.message_id))
+            db.commit()
             if r["src_msg_id"]:
                 await bot.copy_message(chat_id, r["src_chat_id"], r["src_msg_id"])
         except Exception:
@@ -357,12 +422,15 @@ async def send_reminder(r):
 async def reminder_loop():
     while True:
         try:
+            now = now_utc()
             due = db.execute(
                 "SELECT * FROM reminders WHERE status='pending' AND remind_at IS NOT NULL"
-                " AND remind_at <= ? ORDER BY remind_at", (iso(now_utc()),)).fetchall()
+                " AND remind_at <= ? ORDER BY remind_at", (iso(now),)).fetchall()
             for r in due:
-                # позначаємо до відправки, щоб при збої не надсилати по колу
-                db.execute("UPDATE reminders SET status='sent' WHERE id=?", (r["id"],))
+                # Нагадування повертається щодня, поки його не закриють кнопкою
+                nxt = next_occurrence(r["remind_at"], now)
+                db.execute("UPDATE reminders SET remind_at=?, times_sent=times_sent+1"
+                           " WHERE id=?", (iso(nxt), r["id"]))
                 db.commit()
                 await send_reminder(r)
 
