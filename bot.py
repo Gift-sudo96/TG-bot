@@ -28,7 +28,8 @@ def _load_env(path=".env"):
             if not line or line.startswith("#") or "=" not in line:
                 continue
             k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip())
+            # прибираємо пробіли, \r від Windows і лапки, якщо їх дописали
+            os.environ.setdefault(k.strip(), v.strip().strip("\"'").strip())
 
 _load_env()
 
@@ -38,6 +39,27 @@ NOTIFY_ALL = os.environ.get("NOTIFY_ALL", "true").lower() in ("1", "true", "yes"
 TZ = ZoneInfo(os.environ.get("TZ_NAME", "Europe/Kyiv"))
 DEFAULT_HOUR = int(os.environ.get("DEFAULT_HOUR", "10"))
 CHECK_EVERY = 30  # секунд між перевірками бази
+
+
+def check_token(token):
+    """Зрозуміла помилка замість стектрейсу, якщо токен зіпсований."""
+    if not token:
+        raise SystemExit(
+            "\n  У файлі .env не заповнений BOT_TOKEN.\n"
+            "  Візьми токен у @BotFather: /mybots -> твій бот -> API Token\n")
+    if not re.fullmatch(r"\d{6,12}:[A-Za-z0-9_-]{30,}", token):
+        raise SystemExit(
+            f"\n  BOT_TOKEN у файлі .env виглядає неправильно.\n"
+            f"  Зараз там {len(token)} символів і {token.count(':')} двокрапок.\n\n"
+            f"  Правильний вигляд — одне ціле значення від @BotFather:\n"
+            f"    BOT_TOKEN=8123456789:AAH8xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
+            f"    (10 цифр, ОДНА двокрапка, 35 символів, без лапок і пробілів)\n\n"
+            f"  Найчастіша помилка: токен вставили ПОРУЧ із заготовкою,\n"
+            f"  а не замість неї. Видали все після BOT_TOKEN= і встав заново.\n\n"
+            f"  Де взяти: @BotFather -> /mybots -> твій бот -> API Token\n")
+
+
+check_token(TOKEN)
 
 logging.basicConfig(
     level=logging.INFO,
