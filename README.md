@@ -2,36 +2,24 @@
 
 Кидаєш боту скрін оплати або текст — бот нагадає про це у вказаний час.
 
-## Запуск (5 кроків)
+## Встановлення
 
-### 1. Встановити Python
-```
-winget install Python.Python.3.12
-```
-Після встановлення закрий і відкрий термінал заново.
+Бот має працювати цілодобово, тому місце для нього — Linux-сервер (VPS),
+а не звичайний хостинг під сайти. Покрокова інструкція: **[DEPLOY.md](DEPLOY.md)**
 
-### 2. Створити бота
-Написати [@BotFather](https://t.me/BotFather) -> `/newbot` -> назва -> юзернейм.
-У відповідь прийде токен виду `123456:AAA...`
+Коротко:
 
-### 3. Налаштувати
-```
-copy .env.example .env
-```
-Відкрити `.env` і вставити токен у `BOT_TOKEN`.
-`ALLOWED_IDS` поки залишити як є — заповнимо на кроці 5.
-
-### 4. Встановити залежності і запустити
-```
-python -m venv venv
-venv\Scripts\activate
-pip install -r requirements.txt
-python bot.py
+```bash
+git clone https://github.com/Gift-sudo96/TG-bot.git
+cd TG-bot
+bash deploy/install.sh      # створить .env і скаже, що вписати
+nano .env                   # токен від @BotFather + Telegram ID
+bash deploy/install.sh      # поставить як службу і запустить
 ```
 
-### 5. Додати себе і колегу в доступ
-Напиши боту `/id` — він відповість твоїм ID. Хай колега теж напише `/id`.
-Впиши обидва ID у `.env` через кому, перезапусти бота (Ctrl+C, потім `python bot.py`).
+Свій Telegram ID можна дізнатись у самого бота командою `/id` — вона
+працює навіть до того, як тебе внесли в список доступу.
+
 
 ## Як користуватись
 
@@ -95,13 +83,15 @@ python bot.py
 | `REPEAT_HOURS` | крок повтору, за замовчуванням 4 години |
 | `DAY_START` / `DAY_END` | межі, поза якими бот не турбує |
 
-### Корисні скрипти
+### Тести
+
+Після будь-якої зміни в коді варто прогнати — вони перевіряють розбір
+часу, розклад повторів і те, кому йде нагадування:
 
 ```
-venv\Scripts\python.exe demo_flow.py "завтра фіскалізувати" --скрін
-venv\Scripts\python.exe check_access.py
-venv\Scripts\python.exe test_parse.py
-venv\Scripts\python.exe test_repeat.py
+venv/bin/python test_parse.py     # 46 перевірок розбору часу
+venv/bin/python test_repeat.py    # 14 перевірок розкладу повторів
+venv/bin/python test_routing.py   # 8 перевірок, кому що приходить
 ```
 
 ## Важливо
