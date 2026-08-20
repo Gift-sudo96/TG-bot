@@ -9,6 +9,7 @@ import os
 import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from logging.handlers import RotatingFileHandler
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F
@@ -47,6 +48,9 @@ DAY_START = int(os.environ.get("DAY_START", "9"))    # раніше не тур�
 DAY_END = int(os.environ.get("DAY_END", "21"))       # пізніше теж
 REPEAT_HOURS = int(os.environ.get("REPEAT_HOURS", "4"))
 CHECK_EVERY = 30  # секунд між перевірками бази
+# на сервері й у контейнері дані зручно тримати окремо від коду
+DB_PATH = os.environ.get("DB_PATH", "reminders.db")
+LOG_PATH = os.environ.get("LOG_PATH", "bot.log")
 
 # "547696309:Сергій,388521288:Аріна" -> {547696309: "Сергій", ...}
 NAMES = {}
@@ -81,14 +85,16 @@ check_token(TOKEN)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[logging.FileHandler("bot.log", encoding="utf-8"),
+    # на сервері бот працює місяцями, тому лог обмежений: 5 файлів по 2 МБ
+    handlers=[RotatingFileHandler(LOG_PATH, maxBytes=2_000_000, backupCount=5,
+                                  encoding="utf-8"),
               logging.StreamHandler()],
 )
 log = logging.getLogger("bot")
 
 # ------------------------------------------------------------------------ база
 
-db = sqlite3.connect("reminders.db", check_same_thread=False)
+db = sqlite3.connect(DB_PATH, check_same_thread=False)
 db.row_factory = sqlite3.Row
 db.executescript("""
 CREATE TABLE IF NOT EXISTS reminders (

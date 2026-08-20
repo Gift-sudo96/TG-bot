@@ -1,0 +1,6 @@
+# скрипти для Linux мусять лишатися з LF, інакше на сервері
+# буде "bad interpreter: /bin/bash^M"
+*.sh text eol=lf
+*.py text eol=lf
+Dockerfile text eol=lf
+docker-compose.yml text eol=lf

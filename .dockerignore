@@ -1,0 +1,11 @@
+venv/
+.git/
+.env
+*.db
+*.log
+backups/
+__pycache__/
+mockup.html
+test_*.py
+demo_flow.py
+check_access.py
