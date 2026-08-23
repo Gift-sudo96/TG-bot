@@ -64,6 +64,12 @@
 Інший регіон, більша машина або SSD-диск — і почнуть капати гроші.
 Це головна пастка Google Cloud.
 
+Кошторис праворуч на сторінці створення **не враховує безкоштовний
+тариф** — він рахує за повним прайсом і покаже близько $7 на місяць.
+Це нормально. Дивись не на суму, а на склад: у списку мають лишитись
+лише `e2-micro` і `30 GB standard persistent disk`, без рядків
+Snapshot schedule і Logging & monitoring.
+
 Зовнішня IP-адреса безкоштовна, поки прив'язана до працюючої машини.
 Не резервуй статичну — за невикористану Google бере плату. Звичайна
 адреса може змінитись після перезавантаження, але боту це не заважає:
@@ -76,8 +82,14 @@
 
 - **Region**: `us-central1 (Iowa)`
 - **Machine configuration**: General purpose → E2 → **e2-micro**
-- **Boot disk** → Change → **Ubuntu 24.04 LTS**, тип диска
-  **Standard persistent disk**, 30 GB
+- **Boot disk** → Change → **Ubuntu 24.04 LTS**, обовʼязково варіант
+  **x86/64, amd64** (Arm64 на e2-micro не запуститься), тип диска
+  **Standard persistent disk**, 30 GB. Якщо в назві є слово **Minimal**,
+  git там відсутній — постав його першою командою на сервері:
+  `sudo apt update && sudo apt install -y git`
+- **Data protection** → **No backups** (типово там платні знімки диска)
+- **Observability** → **Install Ops Agent** лишити вимкненим, інакше
+  зʼявиться платний рядок Logging & monitoring
 - **Security** → Manage Access → **Add manually generated SSH keys**
   → вставити свій публічний ключ
 - Firewall не чіпати: боту вхідні порти не потрібні
