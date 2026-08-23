@@ -17,18 +17,18 @@ echo
 
 # --------------------------------------------------- 1. системні пакети
 if command -v apt-get >/dev/null 2>&1; then
-  echo "[1/4] Ставлю python3 і venv..."
+  echo "[1/5] Ставлю python3 і venv..."
   sudo apt-get update -qq
   sudo apt-get install -y -qq python3 python3-venv python3-pip
 elif command -v dnf >/dev/null 2>&1; then
-  echo "[1/4] Ставлю python3 і venv..."
+  echo "[1/5] Ставлю python3 і venv..."
   sudo dnf install -y -q python3 python3-pip
 else
-  echo "[1/4] Невідомий пакетний менеджер — переконайся, що python3 уже є."
+  echo "[1/5] Невідомий пакетний менеджер — переконайся, що python3 уже є."
 fi
 
 # ------------------------------------------------------ 2. залежності
-echo "[2/4] Створюю venv і ставлю бібліотеки..."
+echo "[2/5] Створюю venv і ставлю бібліотеки..."
 python3 -m venv "$DIR/venv"
 "$DIR/venv/bin/pip" install --quiet --upgrade pip
 "$DIR/venv/bin/pip" install --quiet -r "$DIR/requirements.txt"
@@ -60,7 +60,7 @@ if grep -qE "^ALLOWED_IDS=(111111111|$)" "$DIR/.env"; then
 fi
 
 # --------------------------------------------------------- 4. systemd
-echo "[3/4] Реєструю службу systemd..."
+echo "[3/5] Реєструю службу systemd..."
 sudo tee /etc/systemd/system/$SERVICE.service >/dev/null <<UNIT
 [Unit]
 Description=Telegram reminder bot
@@ -82,7 +82,37 @@ UNIT
 sudo systemctl daemon-reload
 sudo systemctl enable --now $SERVICE
 
-echo "[4/4] Перевіряю..."
+# --------------------------------------------------- 5. щоденний бекап
+# Таймер systemd, а не cron: в образах Ubuntu Minimal cron не встановлений,
+# а systemd є завжди. Persistent=true дожене пропущений запуск після простою.
+echo "[4/5] Вмикаю щоденний бекап бази..."
+sudo tee /etc/systemd/system/$SERVICE-backup.service >/dev/null <<UNIT
+[Unit]
+Description=Backup $SERVICE database
+
+[Service]
+Type=oneshot
+User=$RUN_AS
+WorkingDirectory=$DIR
+ExecStart=$DIR/venv/bin/python $DIR/deploy/backup.py
+UNIT
+
+sudo tee /etc/systemd/system/$SERVICE-backup.timer >/dev/null <<'UNIT'
+[Unit]
+Description=Daily database backup
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now $SERVICE-backup.timer
+
+echo "[5/5] Перевіряю..."
 sleep 4
 if systemctl is-active --quiet $SERVICE; then
   echo
