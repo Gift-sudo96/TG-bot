@@ -81,6 +81,18 @@ RE_REL_WORD = re.compile(
     r"через\s+(хвилину|півгодини|годину|день|добу|тиждень|неділю|місяць|"
     r"минуту|час|неделю|месяц)", re.I)
 
+# числівники словами: "через два дні" люди пишуть не рідше, ніж "через 2 дні"
+WORD_NUMS = {
+    "один": 1, "одну": 1, "одна": 1, "два": 2, "дві": 2, "пару": 2, "пари": 2,
+    "три": 3, "чотири": 4, "п'ять": 5, "пять": 5, "шість": 6, "сім": 7,
+    "вісім": 8, "дев'ять": 9, "девять": 9, "десять": 10,
+    "кілька": 3, "декілька": 3, "несколько": 3, "пятнадцать": 15,
+}
+RE_REL_WORDNUM = re.compile(
+    r"(?:через|за)\s+(" +
+    "|".join(sorted((re.escape(w) for w in WORD_NUMS), key=len, reverse=True)) +
+    r")\s+(" + _UNITS + r")(?![\wа-яіїєґ])", re.I)
+
 RE_NAMED_DAY = re.compile(
     r"(?<![\wа-яіїєґ])(післязавтра|позавчора|сьогодні|сегодня|завтра|"
     r"післязавтру|послезавтра)(?![\wа-яіїєґ])", re.I)
@@ -188,7 +200,15 @@ def _find_relative(text, spans):
                 "week" if word.startswith(("тижд", "тижн", "недел", "неділ")) else
                 "month")
         spans.add(m)
-        return _delta(1, kind) if word != "півгодини" else timedelta(minutes=30)
+        d = _delta(1, kind) if word != "півгодини" else timedelta(minutes=30)
+        return d, ("min" if word == "півгодини" else kind)
+
+    m = RE_REL_WORDNUM.search(text)
+    if m:
+        kind = _unit_kind(m.group(2))
+        if kind:
+            spans.add(m)
+            return _delta(WORD_NUMS[m.group(1).lower()], kind), kind
 
     for m in RE_REL_NUM.finditer(text):
         prep, prefix = m.group(1), m.group(2)
@@ -207,7 +227,7 @@ def _find_relative(text, spans):
         if num == 0 or num > 999:
             continue
         spans.add(m)
-        return _delta(num, kind)
+        return _delta(num, kind), kind
     return None
 
 
@@ -268,7 +288,10 @@ def _safe_date(now, year, mon, day, roll):
 
 def _find_time(text, spans, day_found=False):
     """Повертає (година, хвилина) або None."""
-    part_m = RE_DAYPART.search(text)
+    # пропускаємо те, що вже з'їдено як одиниця часу: у "через 2 дня"
+    # слово "дня" — це доба, а не "вдень"
+    part_m = next((m for m in RE_DAYPART.finditer(text)
+                   if not spans.taken(m.start(1))), None)
     word = part_m.group(1).lower() if part_m else None
 
     def done(h, mi, bare):
@@ -320,7 +343,17 @@ def parse(text, now):
 
     rel = _find_relative(low, spans)
     if rel is not None:
-        return (now + rel).replace(second=0, microsecond=0), spans.cut(raw)
+        delta, kind = rel
+        dt = (now + delta).replace(second=0, microsecond=0)
+        if kind in ("day", "week", "month"):
+            # Для зсуву в добах хвилина написання не має сенсу: "через 2 дні",
+            # написане о 18:25, означає позавтра, а не "позавтра о 18:25".
+            # Тому беремо явно вказаний час, а якщо його немає — ранкову
+            # годину за замовчуванням, як і для звичайних дат.
+            tm = _find_time(low, spans, day_found=True)
+            h, mi = tm if tm else (DEFAULT_HOUR, 0)
+            dt = dt.replace(hour=h, minute=mi)
+        return dt, spans.cut(raw)
 
     day = _find_day(low, now, spans)
     tm = _find_time(low, spans, day_found=day is not None)

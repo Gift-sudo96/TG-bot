@@ -120,8 +120,10 @@ CREATE TABLE IF NOT EXISTS sent (
 );
 CREATE INDEX IF NOT EXISTS idx_sent ON sent(reminder_id);
 """)
-if "times_sent" not in {c[1] for c in db.execute("PRAGMA table_info(reminders)")}:
-    db.execute("ALTER TABLE reminders ADD COLUMN times_sent INTEGER DEFAULT 0")
+_cols = {c[1] for c in db.execute("PRAGMA table_info(reminders)")}
+for _col, _ddl in (("times_sent", "INTEGER DEFAULT 0"), ("raw_text", "TEXT")):
+    if _col not in _cols:
+        db.execute(f"ALTER TABLE reminders ADD COLUMN {_col} {_ddl}")
 db.commit()
 
 
@@ -342,7 +344,8 @@ async def catch_all(m: Message):
     if not allowed(m.from_user.id):
         return await m.answer(f"Немає доступу. Твій ID: <code>{m.from_user.id}</code>")
 
-    when, note = parse_when(m.caption or m.text or "")
+    raw = m.caption or m.text or ""
+    when, note = parse_when(raw)
     guessed = when is None
     if guessed:                      # часу в тексті немає -> завтра о 9:00
         when = iso(next_nine())
@@ -354,9 +357,10 @@ async def catch_all(m: Message):
 
     cur = db.execute(
         "INSERT INTO reminders (creator_id, creator_name, src_chat_id, src_msg_id,"
-        " note, created_at, remind_at, status) VALUES (?,?,?,?,?,?,?,'pending')",
+        " note, created_at, remind_at, status, raw_text)"
+        " VALUES (?,?,?,?,?,?,?,'pending',?)",
         (m.from_user.id, uname(m), m.chat.id, m.message_id if media else None, note,
-         iso(now_utc()), when))
+         iso(now_utc()), when, raw[:1000]))
     db.commit()
     rid = cur.lastrowid
 
