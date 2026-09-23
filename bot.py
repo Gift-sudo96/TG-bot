@@ -48,6 +48,8 @@ DAY_START = int(os.environ.get("DAY_START", "9"))    # раніше не тур�
 DAY_END = int(os.environ.get("DAY_END", "21"))       # пізніше теж
 REPEAT_HOURS = int(os.environ.get("REPEAT_HOURS", "4"))
 CHECK_EVERY = 30  # секунд між перевірками бази
+MEDIA_GROUP_WAIT = 2.0  # скільки чекати решту фото з альбому
+_albums = {}            # media_group_id -> повідомлення, що вже надійшли
 # на сервері й у контейнері дані зручно тримати окремо від коду
 DB_PATH = os.environ.get("DB_PATH", "reminders.db")
 LOG_PATH = os.environ.get("LOG_PATH", "bot.log")
@@ -121,7 +123,8 @@ CREATE TABLE IF NOT EXISTS sent (
 CREATE INDEX IF NOT EXISTS idx_sent ON sent(reminder_id);
 """)
 _cols = {c[1] for c in db.execute("PRAGMA table_info(reminders)")}
-for _col, _ddl in (("times_sent", "INTEGER DEFAULT 0"), ("raw_text", "TEXT")):
+for _col, _ddl in (("times_sent", "INTEGER DEFAULT 0"), ("raw_text", "TEXT"),
+                   ("src_msg_ids", "TEXT")):
     if _col not in _cols:
         db.execute(f"ALTER TABLE reminders ADD COLUMN {_col} {_ddl}")
 db.commit()
@@ -339,12 +342,17 @@ async def cmd_cancel(m: Message):
                    else f"Нагадування #{rid} не знайдено серед активних.")
 
 
-@dp.message(F.photo | F.document | F.video | F.text)
-async def catch_all(m: Message):
-    if not allowed(m.from_user.id):
-        return await m.answer(f"Немає доступу. Твій ID: <code>{m.from_user.id}</code>")
+def has_media(m):
+    """Чи є в повідомленні що показувати при нагадуванні."""
+    return bool(m.photo or m.document or m.video or m.animation
+                or m.audio or m.voice or m.video_note)
 
-    raw = m.caption or m.text or ""
+
+async def create_reminder(msgs):
+    """Одне нагадування з одного повідомлення або з цілого альбому."""
+    first = msgs[0]
+    # підпис Telegram кладе лише до одного фото з альбому — шукаємо, до якого
+    raw = next((m.caption or m.text for m in msgs if (m.caption or m.text)), "")
     when, note = parse_when(raw)
     guessed = when is None
     if guessed:                      # часу в тексті немає -> завтра о 9:00
@@ -352,22 +360,61 @@ async def catch_all(m: Message):
 
     # копіюємо оригінал лише коли там є що показувати. Для звичайного
     # тексту опис уже все несе, і друге повідомлення було б дублем.
-    media = bool(m.photo or m.document or m.video or m.animation
-                 or m.audio or m.voice or m.video_note)
+    ids = [m.message_id for m in msgs if has_media(m)]
 
     cur = db.execute(
         "INSERT INTO reminders (creator_id, creator_name, src_chat_id, src_msg_id,"
-        " note, created_at, remind_at, status, raw_text)"
-        " VALUES (?,?,?,?,?,?,?,'pending',?)",
-        (m.from_user.id, uname(m), m.chat.id, m.message_id if media else None, note,
-         iso(now_utc()), when, raw[:1000]))
+        " src_msg_ids, note, created_at, remind_at, status, raw_text)"
+        " VALUES (?,?,?,?,?,?,?,?,'pending',?)",
+        (first.from_user.id, uname(first), first.chat.id,
+         ids[0] if ids else None, ",".join(str(i) for i in ids) or None,
+         note, iso(now_utc()), when, raw[:1000]))
     db.commit()
     rid = cur.lastrowid
 
-    text = confirm(when, rid, targets(m.from_user.id))
+    text = confirm(when, rid, targets(first.from_user.id))
+    if len(ids) > 1:
+        text += f"\nВкладень: {len(ids)}"
     if guessed:
         text += "\nЧасу не було вказано. Інший — просто напиши ще раз із ним."
-    await m.reply(text)
+    await first.reply(text)
+
+
+async def _flush_album(gid):
+    """Через паузу збираємо всі фото групи в одне нагадування."""
+    await asyncio.sleep(MEDIA_GROUP_WAIT)
+    msgs = _albums.pop(gid, [])
+    if not msgs:
+        return
+    msgs.sort(key=lambda m: m.message_id)
+    try:
+        await create_reminder(msgs)
+    except Exception:
+        log.exception("не вдалось зібрати альбом %s", gid)
+
+
+@dp.message(F.media_group_id)
+async def catch_album(m: Message):
+    """Альбом приходить кількома повідомленнями з однаковим media_group_id.
+
+    Перше запускає таймер, решта просто докладаються до нього, і вже
+    після паузи створюється ОДНЕ нагадування на всі фото.
+    """
+    if not allowed(m.from_user.id):
+        return
+    gid = m.media_group_id
+    if gid in _albums:
+        _albums[gid].append(m)
+        return
+    _albums[gid] = [m]
+    asyncio.create_task(_flush_album(gid))
+
+
+@dp.message(F.photo | F.document | F.video | F.text)
+async def catch_all(m: Message):
+    if not allowed(m.from_user.id):
+        return await m.answer(f"Немає доступу. Твій ID: <code>{m.from_user.id}</code>")
+    await create_reminder([m])
 
 
 @dp.callback_query(F.data.startswith("done:"))
@@ -382,8 +429,10 @@ async def cb_done(c: CallbackQuery):
     text = (f"✅ <s>{note}</s>" if note else "✅ <s>Нагадування</s>")
     text += f"\nзакрито · {closer} · {datetime.now(TZ):%H:%M}"
 
-    # оновлюємо всі копії, щоб і друга людина побачила, що справу закрито
-    was_photo = bool(row and row["src_msg_id"])
+    # оновлюємо всі копії, щоб і друга людина побачила, що справу закрито.
+    # Підпис редагується лише коли фото одне: в альбомі картка з кнопкою —
+    # це окреме текстове повідомлення.
+    was_photo = bool(row) and len(media_ids(row)) == 1
     rows = db.execute("SELECT * FROM sent WHERE reminder_id=?", (rid,)).fetchall()
     got_it = {s["chat_id"] for s in rows}
     for s in rows:
@@ -440,16 +489,31 @@ def reminder_text(r):
     return (f"⏰ <b>{note}</b>" if note else "⏰ <b>Нагадування</b>") + "\n" + meta
 
 
+def media_ids(r):
+    """Номери повідомлень із вкладеннями, які треба показати при нагадуванні."""
+    raw = r["src_msg_ids"] if "src_msg_ids" in r.keys() else None
+    if raw:
+        return [int(x) for x in raw.split(",") if x]
+    return [r["src_msg_id"]] if r["src_msg_id"] else []
+
+
 async def send_reminder(r):
     text = reminder_text(r)
     kb = kb_remind(r["id"])
+    ids = media_ids(r)
     for chat_id in targets(r["creator_id"]):
         mid = None
         try:
-            if r["src_msg_id"]:
-                # скрін і підпис одним повідомленням, щоб кнопка явно
-                # належала саме цьому скріну, а не висіла окремо над ним
-                res = await bot.copy_message(chat_id, r["src_chat_id"], r["src_msg_id"],
+            if len(ids) > 1:
+                # До альбому Telegram не дозволяє чіпляти кнопку, тому
+                # спершу самі фото, а під ними картка з "Готово".
+                await bot.copy_messages(chat_id, r["src_chat_id"], ids,
+                                        remove_caption=True)
+                mid = (await bot.send_message(chat_id, text,
+                                              reply_markup=kb)).message_id
+            elif ids:
+                # одне фото — підпис і кнопка прямо на ньому
+                res = await bot.copy_message(chat_id, r["src_chat_id"], ids[0],
                                              caption=text, parse_mode=ParseMode.HTML,
                                              reply_markup=kb)
                 mid = res.message_id
